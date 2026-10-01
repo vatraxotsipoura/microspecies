@@ -121,70 +121,141 @@ def net_charge(sites: list[IonizableSite], state: tuple[bool, ...]) -> int:
     return charge
 
 
+def _has_double_bond_to_o(atom) -> bool:
+    """True if `atom` carries a C=O, S=O or P=O (or C=S) double bond."""
+    for bond in atom.GetBonds():
+        other = bond.GetOtherAtom(atom)
+        if bond.GetBondType() == Chem.BondType.DOUBLE and other.GetSymbol() in ("O", "S"):
+            return True
+    return False
+
+
+def _acid_rank(atom) -> int | None:
+    """
+    Rank an atom as an acid candidate (lower = more acidic), or None.
+
+    0: carboxylic / sulfonic / phosphonic O-H   1: phenol O-H
+    2: thiol S-H, sulfonamide / imide N-H        3: alcohol O-H
+    """
+    if atom.GetTotalNumHs() == 0 or atom.GetFormalCharge() != 0:
+        return None
+    sym = atom.GetSymbol()
+    heavy = [nb for nb in atom.GetNeighbors() if nb.GetAtomicNum() > 1]
+    if sym == "O":
+        if len(heavy) != 1:
+            return None
+        nb = heavy[0]
+        if _has_double_bond_to_o(nb):
+            return 0
+        if nb.GetIsAromatic():
+            return 1
+        return 3
+    if sym == "S":
+        return 2
+    if sym == "N" and not atom.GetIsAromatic():
+        sulfonyl = any(nb.GetSymbol() == "S" and _has_double_bond_to_o(nb) for nb in heavy)
+        n_acyl = sum(_has_double_bond_to_o(nb) for nb in heavy)
+        if sulfonyl or n_acyl >= 2:
+            return 2
+    return None
+
+
+def _base_rank(atom) -> int | None:
+    """
+    Rank an atom as a base candidate (lower = more basic), or None.
+
+    0: aliphatic amine, amidine/guanidine/imine N   1: aniline-type N
+    2: pyridine-type aromatic N
+    Amide, sulfonamide, nitro, nitrile, N-oxide and quaternary N are excluded.
+    """
+    if atom.GetSymbol() != "N" or atom.GetFormalCharge() != 0:
+        return None
+    heavy = [nb for nb in atom.GetNeighbors() if nb.GetAtomicNum() > 1]
+    if any(nb.GetSymbol() == "O" for nb in heavy):
+        return None
+    if any(b.GetBondType() == Chem.BondType.TRIPLE for b in atom.GetBonds()):
+        return None
+    if atom.GetIsAromatic():
+        if atom.GetTotalNumHs() == 0 and atom.GetDegree() == 2:
+            return 2
+        return None
+    if any(_has_double_bond_to_o(nb) for nb in heavy):
+        return None  # amide / sulfonamide / urea
+    if any(nb.GetIsAromatic() for nb in heavy):
+        return 1
+    return 0
+
+
 def auto_detect_atom_indices(smiles: str, sites: list[IonizableSite]) -> list[IonizableSite]:
     """
     Auto-detect atom indices for ionizable sites that don't have one set.
 
-    Strategy:
-      - base sites: find N atoms (not aromatic, not amide) — assign in order
-      - acid sites: find O-H groups (alcohols, carboxylic acids) — assign in order
+    Candidates are ranked by group type (see _acid_rank / _base_rank, ties in
+    SMILES order). Acid sites are matched in order of increasing pKa to the
+    most acidic candidates, base sites in order of decreasing pKa to the most
+    basic ones. Atoms already assigned explicitly are never reused.
 
     Returns a new list with atom_idx populated.
     """
     mol = Chem.MolFromSmiles(smiles)
     if mol is None:
         raise ValueError(f"Invalid SMILES: {smiles}")
-    mol = Chem.AddHs(mol)
 
-    # Collect candidate atoms
-    base_candidates = []  # N atoms
-    acid_candidates = []  # O atoms bonded to H
-
+    taken = {s.atom_idx for s in sites if s.atom_idx is not None}
+    candidates = {"acid": [], "base": []}
     for atom in mol.GetAtoms():
-        sym = atom.GetSymbol()
-        idx = atom.GetIdx()
-        if sym == "N" and not atom.GetIsAromatic():
-            base_candidates.append(idx)
-        elif sym == "O":
-            # Check if bonded to at least one H
-            has_h = any(nb.GetSymbol() == "H" for nb in atom.GetNeighbors())
-            if has_h:
-                acid_candidates.append(idx)
-        elif sym == "S":
-            has_h = any(nb.GetSymbol() == "H" for nb in atom.GetNeighbors())
-            if has_h:
-                acid_candidates.append(idx)
+        for site_type, rank_fn in (("acid", _acid_rank), ("base", _base_rank)):
+            rank = rank_fn(atom)
+            if rank is not None:
+                candidates[site_type].append((rank, atom.GetIdx()))
+    for c in candidates.values():
+        c.sort()
 
-    base_iter = iter(base_candidates)
-    acid_iter = iter(acid_candidates)
-
-    updated = []
-    for site in sites:
-        if site.atom_idx is not None:
-            updated.append(site)
-            continue
-        new_site = IonizableSite(
-            pka=site.pka, site_type=site.site_type,
-            label=site.label, atom_idx=site.atom_idx,
-        )
-        if site.site_type == "base":
-            try:
-                new_site.atom_idx = next(base_iter)
-            except StopIteration:
+    updated = [IonizableSite(pka=s.pka, site_type=s.site_type,
+                             label=s.label, atom_idx=s.atom_idx) for s in sites]
+    for site_type, strongest_first in (("acid", False), ("base", True)):
+        pending = sorted((s for s in updated
+                          if s.site_type == site_type and s.atom_idx is None),
+                         key=lambda s: s.pka, reverse=strongest_first)
+        for site in pending:
+            pool = [idx for _, idx in candidates[site_type] if idx not in taken]
+            if not pool:
+                group = "O-H/S-H/N-H" if site_type == "acid" else "basic N"
                 raise ValueError(
-                    f"Not enough N atoms found for base site '{site.label}'. "
-                    "Specify atom_idx manually."
+                    f"Not enough {group} groups found for {site_type} site "
+                    f"'{site.label or site.pka}'. Specify atom_idx manually."
                 )
-        else:  # acid
-            try:
-                new_site.atom_idx = next(acid_iter)
-            except StopIteration:
-                raise ValueError(
-                    f"Not enough O-H groups found for acid site '{site.label}'. "
-                    "Specify atom_idx manually."
-                )
-        updated.append(new_site)
+            site.atom_idx = pool[0]
+            taken.add(site.atom_idx)
     return updated
+
+
+def validate_sites(smiles: str, sites: list[IonizableSite]) -> None:
+    """
+    Check that resolved sites point at sensible, distinct atoms.
+    Raises ValueError with a readable message otherwise.
+    """
+    mol = Chem.MolFromSmiles(smiles)
+    if mol is None:
+        raise ValueError(f"Invalid SMILES: {smiles}")
+    seen = {}
+    for site in sites:
+        name = site.label or f"{site.site_type} pKa {site.pka:g}"
+        idx = site.atom_idx
+        if idx is None or not 0 <= idx < mol.GetNumAtoms():
+            raise ValueError(f"Site '{name}': atom index {idx} is out of range "
+                             f"(molecule has atoms 0-{mol.GetNumAtoms() - 1}).")
+        if idx in seen:
+            raise ValueError(f"Sites '{seen[idx]}' and '{name}' both use atom {idx}.")
+        seen[idx] = name
+        atom = mol.GetAtomWithIdx(idx)
+        desc = f"atom {idx} ({atom.GetSymbol()}, {atom.GetTotalNumHs()} H)"
+        if site.site_type == "acid" and (atom.GetSymbol() not in ("O", "S", "N")
+                                         or atom.GetTotalNumHs() == 0):
+            raise ValueError(f"Acid site '{name}': {desc} has no ionizable O-H/S-H/N-H.")
+        if site.site_type == "base" and (atom.GetSymbol() != "N"
+                                         or atom.GetFormalCharge() != 0):
+            raise ValueError(f"Base site '{name}': {desc} is not a neutral nitrogen.")
 
 
 def microspecies_smiles(smiles: str,
@@ -233,3 +304,39 @@ def microspecies_smiles(smiles: str,
         return Chem.MolToSmiles(mol)
     except Exception:
         return smiles
+
+
+def compute_logd(sites: list[IonizableSite],
+                 species: list[dict],
+                 logp: float,
+                 cation_offset: float = 3.0,
+                 anion_offset: float = 4.0,
+                 zwitterion_offset: float = 3.0) -> np.ndarray:
+    """
+    Compute logD across the pH grid of `species`.
+
+        logD(pH) = log10( Σ_i f_i(pH) · P_i )
+
+    The neutral (fully uncharged) microspecies partitions with P = 10^logp.
+    Each ionized group lowers a microspecies' logP (ion-pair partitioning,
+    Avdeef's "diff 3-4" rule for octanol/0.15 M KCl): a protonated base by
+    `cation_offset`, a deprotonated acid by `anion_offset`. Each (+, -) pair
+    on the same microspecies counts once as `zwitterion_offset` instead, since
+    the internal charges partly neutralize each other.
+
+    Defaults are fitted to measured profiles: lidocaine 3.0 and propranolol
+    2.7 (bases), ibuprofen 4.1 (acid), and 3.03 for the zwitterions of
+    morphine, naloxone, naltrexone and oxymorphone (Mazak & Noszal 2019).
+    """
+    p_total = np.zeros_like(species[0]["fractions"])
+    for s in species:
+        n_cation = sum(site.site_type == "base" and is_prot
+                       for site, is_prot in zip(sites, s["protonated"]))
+        n_anion = sum(site.site_type == "acid" and not is_prot
+                      for site, is_prot in zip(sites, s["protonated"]))
+        n_pair = min(n_cation, n_anion)
+        logp_i = (logp - zwitterion_offset * n_pair
+                  - cation_offset * (n_cation - n_pair)
+                  - anion_offset * (n_anion - n_pair))
+        p_total += (s["fractions"] / 100.0) * 10.0 ** logp_i
+    return np.log10(p_total)

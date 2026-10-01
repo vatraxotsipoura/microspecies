@@ -142,16 +142,97 @@ def build_chart(ph_values: np.ndarray,
     return fig
 
 
+def logd_at(ph_values: np.ndarray, logd: np.ndarray, ph: float) -> float:
+    """Interpolate logD at a given pH."""
+    return float(np.interp(ph, ph_values, logd))
+
+
+def build_logd_chart(ph_values: np.ndarray, logd: dict) -> go.Figure:
+    """
+    Build the logD vs pH chart.
+
+    `logd` holds "logp", "logp_type", the offsets and "curve" (logD at each pH).
+    """
+    fig = go.Figure()
+    curve = logd["curve"]
+    name = "logD"
+
+    fig.add_trace(go.Scatter(
+        x=ph_values,
+        y=curve,
+        mode="lines",
+        name=name,
+        line=dict(color="#1f77b4", width=2.5),
+        hovertemplate="pH %{x:.1f}<br>logD %{y:.2f}<extra></extra>",
+    ))
+
+    if logd.get("ref"):
+        ref_ph, ref_logd = zip(*logd["ref"])
+        fig.add_trace(go.Scatter(
+            x=ref_ph,
+            y=ref_logd,
+            mode="markers",
+            name="Literature",
+            marker=dict(color="#ff7f0e", size=9, symbol="diamond",
+                        line=dict(color="white", width=1)),
+            hovertemplate="pH %{x:.2f}<br>logD %{y:.2f}<extra>literature</extra>",
+        ))
+        curve_min = min(curve.min(), min(ref_logd))
+    else:
+        curve_min = curve.min()
+
+    logp_type = logd.get("logp_type", "neutral")
+    fig.add_hline(y=logd["logp"], line=dict(color="#2ca02c", width=1, dash="dot"),
+                  annotation_text=f"logP ({logp_type}) = {logd['logp']:.2f}",
+                  annotation_position="top left")
+
+    y_min = np.floor(curve_min) - 0.5
+    y_max = np.ceil(max(logd["logp"], curve.max())) + 1
+
+    fig.update_layout(
+        xaxis=dict(title="pH", range=[ph_values[0], ph_values[-1]],
+                   dtick=2, gridcolor="#eee"),
+        yaxis=dict(title="logD", range=[y_min, y_max], dtick=1, gridcolor="#eee"),
+        plot_bgcolor="white",
+        legend=dict(orientation="h", yanchor="bottom", y=1.02,
+                    xanchor="center", x=0.5, font=dict(size=11)),
+        margin=dict(l=60, r=30, t=80, b=60),
+        width=900,
+        height=450,
+    )
+    return fig
+
+
 def build_html(ph_values: np.ndarray,
                species: list[dict],
                smiles: str,
                sites: list[IonizableSite],
-               title: str = "Microspecies Distribution") -> str:
+               title: str = "Microspecies Distribution",
+               logd: dict | None = None) -> str:
     """
     Build a complete standalone HTML page with chart + structure images.
+    If `logd` is given (see build_logd_chart), a logD vs pH chart is added.
     """
     fig = build_chart(ph_values, species, title)
     chart_html = fig.to_html(full_html=False, include_plotlyjs="cdn")
+
+    logd_section = ""
+    if logd is not None:
+        logd_fig = build_logd_chart(ph_values, logd)
+        logd_chart = logd_fig.to_html(full_html=False, include_plotlyjs=False)
+        model = (f"Ion-pair partitioning: logP − {logd['cation_offset']:g} per cationic "
+                 f"group, − {logd['anion_offset']:g} per anionic group, "
+                 f"− {logd.get('zwitterion_offset', 3.0):g} per (+,−) pair.")
+        logd74 = logd_at(ph_values, logd["curve"], 7.4)
+        logp_type = logd.get("logp_type", "neutral")
+        logd_section = f"""
+    <div class="chart-container">
+        <h3 style="margin-top:0; color: #333;">Lipophilicity — logD vs pH</h3>
+        <div style="color:#666; font-size:13px;">
+            logP ({logp_type}) = {logd['logp']:.2f} · logD<sub>7.4</sub> = {logd74:.2f} · {model}
+        </div>
+        {logd_chart}
+    </div>"""
 
     # Auto-detect atom indices if needed
     resolved_sites = auto_detect_atom_indices(smiles, sites)
@@ -285,6 +366,7 @@ def build_html(ph_values: np.ndarray,
     <div class="structures-row">
         {structures_row}
     </div>
+{logd_section}
 
     <div class="pka-table">
         <h3 style="margin-top:0; color: #333;">pKa Values</h3>
